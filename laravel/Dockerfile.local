@@ -1,0 +1,102 @@
+FROM php:8.1-fpm-alpine
+
+COPY docker/nscacert.pem /usr/local/share/ca-certificates/
+RUN cat /usr/local/share/ca-certificates/nscacert.pem >> /usr/local/share/ca-certificates/my-cert.crt
+
+RUN update-ca-certificates
+RUN apk add --no-cache bash nginx wget oniguruma-dev
+
+RUN apk update && \
+    apk add --no-cache\
+    icu-dev \
+    libtool \
+    freetype-dev \
+    libpng-dev \
+    libjpeg \
+    libjpeg-turbo-dev \
+    libzip-dev \
+    jpeg-dev \
+    nginx \
+    wget \
+    zip
+
+RUN apk add --update --no-cache supervisor redis
+
+# Install Php Redis Extension
+RUN apk add --no-cache --virtual .build-deps \
+    $PHPIZE_DEPS && \
+    pecl install -o -f redis \
+    &&  rm -rf /tmp/pear \
+    &&  docker-php-ext-enable redis
+
+# Clear cache
+RUN rm -rf /var/cache/apk/*
+
+# Install prerequisites required for tools and extensions installed later on.
+RUN apk add --update bash gnupg less libpng-dev libzip-dev su-exec unzip
+
+# Install extensions
+# Make it readable and arrange from A-Z
+RUN docker-php-ext-install \
+    bcmath \
+    exif \
+    mbstring \
+    opcache \
+    pdo \
+    pdo_mysql \
+    pcntl \
+    gd \
+    zip
+
+RUN pecl install -o -f redis \
+    &&  rm -rf /tmp/pear \
+    &&  docker-php-ext-enable redis
+
+RUN mkdir -p /run/nginx
+
+COPY docker/nginx.conf /etc/nginx/nginx.conf
+COPY docker/www.conf /usr/local/etc/php-fpm.d/www.conf
+
+RUN mkdir -p /app
+COPY . /app
+COPY .env.local /app/.env
+
+ENV ACCEPT_EULA=Y
+ENV COMPOSER_ALLOW_SUPERUSER=1
+
+RUN sh -c "wget http://getcomposer.org/composer.phar && chmod a+x composer.phar && mv composer.phar /usr/local/bin/composer"
+
+RUN cd /app && \
+    /usr/local/bin/composer install --no-dev && \
+    /usr/local/bin/composer dump-autoload
+
+RUN mv /usr/local/etc/php/php.ini-development /usr/local/etc/php/php.ini
+COPY docker/upload.ini /usr/local/etc/php/conf.d/upload.ini
+RUN echo "PHP_INI_SCAN_DIR=/usr/local/etc/php/conf.d/" > /usr/local/etc/php/php.ini
+
+# copy supervisor configuration
+RUN mkdir -p /var/log/supervisor /etc/supervisor/conf.d
+COPY docker/supervisord.conf /etc/supervisor/supervisord.conf
+
+#copy supervisor conf
+COPY docker/conf/queue.conf /etc/supervisor/conf.d/queue.conf
+COPY docker/conf/nginx.conf /etc/supervisor/conf.d/nginx.conf
+COPY docker/conf/crontab.conf /etc/supervisor/conf.d/crontab.conf
+
+# copy SH run by Supervisor
+COPY docker/conf/sh/nginx.sh /etc/supervisor/nginx.sh
+COPY docker/conf/sh/crontab.sh /etc/supervisor/crontab.sh
+
+RUN chmod +x /etc/supervisor/crontab.sh
+RUN chmod +x /etc/supervisor/nginx.sh
+
+# Add the cron job
+RUN echo '* * * * * php /app/artisan schedule:run >> /dev/null 2>&1' > /etc/crontabs/root
+
+RUN chown -R www-data: /app
+RUN chown -R www-data: /app/storage
+RUN chmod 775 -R /app/storage
+
+EXPOSE 8080
+
+ENTRYPOINT [ "sh", "/app/docker/startup.sh" ]
